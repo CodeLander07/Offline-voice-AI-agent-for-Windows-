@@ -3,6 +3,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
+import ctypes
 from pathlib import Path
 from tkinter import ttk
 
@@ -11,6 +12,9 @@ import javis
 
 APP_DIR = Path(__file__).resolve().parent
 LOGO_PATH = APP_DIR / "logo.png"
+ICON_PATH = APP_DIR / "logo.ico"
+OFFLINE_MARKER = "__JAVIS_UI_OFFLINE__"
+WINDOWS_APP_ID = "ProjectJavis.Javis.DeepMidnight.1"
 
 
 class QueueWriter:
@@ -29,6 +33,7 @@ class QueueWriter:
 
 class JavisTerminalApp:
     def __init__(self) -> None:
+        self._set_windows_app_id()
         self.root = tk.Tk()
         self.root.title("Javis")
         self.root.geometry("960x620")
@@ -43,7 +48,9 @@ class JavisTerminalApp:
 
         self._build_styles()
         self._build_layout()
+        self._apply_window_icon()
         self._poll_output()
+        self.root.after(300, self.start_agent)
 
     def _build_styles(self) -> None:
         style = ttk.Style()
@@ -157,7 +164,7 @@ class JavisTerminalApp:
 
         self.start_button = ttk.Button(
             controls,
-            text="Start Javis",
+            text="Javis Starting",
             style="Javis.TButton",
             command=self.start_agent,
         )
@@ -178,7 +185,22 @@ class JavisTerminalApp:
             font=("Segoe UI", 9),
         ).pack(side="left", padx=14)
 
-        self._append("[system] Interface ready. Press Start Javis.\n")
+        self._append("[system] Interface ready. Javis will start automatically.\n")
+
+    def _apply_window_icon(self) -> None:
+        if ICON_PATH.exists():
+            self.root.iconbitmap(default=str(ICON_PATH))
+        if self.logo_image is not None:
+            self.root.iconphoto(True, self.logo_image)
+
+    @staticmethod
+    def _set_windows_app_id() -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)
+        except Exception:
+            pass
 
     def _append(self, text: str) -> None:
         self.output.configure(state="normal")
@@ -189,7 +211,11 @@ class JavisTerminalApp:
     def _poll_output(self) -> None:
         try:
             while True:
-                self._append(self.output_queue.get_nowait())
+                text = self.output_queue.get_nowait()
+                if text == OFFLINE_MARKER:
+                    self._mark_offline()
+                else:
+                    self._append(text)
         except queue.Empty:
             pass
         self.root.after(80, self._poll_output)
@@ -198,7 +224,7 @@ class JavisTerminalApp:
         if self.started:
             return
         self.started = True
-        self.start_button.configure(state="disabled")
+        self.start_button.configure(text="Javis Running", state="disabled")
         self.status_label.configure(text="ONLINE", fg="#86efac", bg="#10251d")
 
         self.agent_thread = threading.Thread(target=self._run_agent, daemon=True)
@@ -218,11 +244,11 @@ class JavisTerminalApp:
             sys.stdout = original_stdout
             sys.stderr = original_stderr
             self.output_queue.put("[system] Runtime ended.\n")
-            self.root.after(0, self._mark_offline)
+            self.output_queue.put(OFFLINE_MARKER)
 
     def _mark_offline(self) -> None:
         self.status_label.configure(text="OFFLINE", fg="#94a3b8", bg="#101827")
-        self.start_button.configure(state="normal")
+        self.start_button.configure(text="Restart Javis", state="normal")
         self.started = False
 
     def close(self) -> None:

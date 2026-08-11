@@ -1,6 +1,6 @@
-# Project Javis
+# A local, offline voice AI agent for Windows with a Deep Midnight desktop interface.
 
-A local, offline voice AI agent for Windows.
+
 
 ## What it does (v2)
 
@@ -8,6 +8,7 @@ A local, offline voice AI agent for Windows.
 2. Asks "What would you like to do?" and listens for a voice command.
 3. Performs web searches via DuckDuckGo and reads the top 3 results aloud.
 4. Loops with "Anything else?" until you say goodbye or go silent.
+5. Shows runtime logs inside a custom terminal-style app window instead of Windows Terminal.
 
 ### Voice commands
 
@@ -30,6 +31,7 @@ A local, offline voice AI agent for Windows.
 | Text-to-Speech  | Windows SAPI (pyttsx3) | Offline | Free |
 | Audio I/O       | sounddevice / PortAudio | Local | Free |
 | Web search      | DuckDuckGo Instant Answer API (requests) | Online | Free |
+| Interface       | Tkinter custom terminal window | Local | Free |
 
 ## Install
 
@@ -37,13 +39,15 @@ A local, offline voice AI agent for Windows.
 2. Double-click `install.bat`.
 
 The installer will:
-- Install Python dependencies
-- Register Javis in `shell:startup` so it runs on every Windows login
-- On first launch, Javis downloads the ~50MB Vosk model to `./models/`
+- Install Python dependencies.
+- Register Javis in `shell:startup` so it runs on every Windows login.
+- On first launch, Javis downloads the ~50MB Vosk model to `./models/`.
 
 ## Run manually
 
 Double-click `run.bat`.
+
+This opens the Javis interface and starts the voice session automatically.
 
 ## Uninstall
 
@@ -51,21 +55,24 @@ Double-click `uninstall.bat` to remove the startup entry. Then delete this folde
 
 ## File layout
 
-```
+```text
 Project_Javis/
-├── javis.py          # Voice loop, command router, main
-├── search.py         # DuckDuckGo searcher (data layer)
-├── requirements.txt  # Python deps
-├── install.bat       # One-time installer
-├── run.bat           # Manual launcher
-├── run_silent.bat    # Internal: hidden launcher for startup
-├── uninstall.bat     # Removes startup entry
-└── models/           # Created on first run (Vosk model)
+|-- app_ui.py         # Deep Midnight desktop interface
+|-- javis.py          # Voice loop, command router, main
+|-- logo.png          # App logo used by the interface
+|-- logo.ico          # Windows taskbar/window icon
+|-- search.py         # DuckDuckGo searcher
+|-- requirements.txt  # Python deps
+|-- install.bat       # One-time installer
+|-- run.bat           # Manual UI launcher
+|-- run_silent.bat    # Internal hidden UI launcher for startup
+|-- uninstall.bat     # Removes startup entry
+`-- models/           # Created on first run
 ```
 
 ## Next steps (v3+)
 
 - Wake-word detection ("Hey Javis") so the agent stays listening.
-- More command handlers: open apps, run shell commands, dictate text, fetch & read a URL.
+- More command handlers: open apps, run shell commands, dictate text, fetch and read a URL.
 - Conversation memory across sessions.
 - Plug in an LLM (local Llama or cloud) for free-form replies.

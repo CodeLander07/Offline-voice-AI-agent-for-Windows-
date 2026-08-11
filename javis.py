@@ -327,19 +327,24 @@ def format_search_results(results: list[SearchResult], *, max_results: int = 3) 
     top = results[:max_results]
     chunks = []
     for i, r in enumerate(top, start=1):
+        title = " ".join(r.title.split())
         snippet = r.snippet
         snippet = " ".join(snippet.split())  # collapse whitespace
         if len(snippet) > 200:
             snippet = snippet[:200].rsplit(" ", 1)[0] + "..."
         words = {1: "first", 2: "second", 3: "third"}
         label = words.get(i, f"result {i}")
-        chunks.append(f"{label}: {snippet}")
+        if title and title.lower() not in snippet.lower():
+            chunks.append(f"{label}: {title}. {snippet}")
+        else:
+            chunks.append(f"{label}: {snippet}")
     return " ".join(chunks)
 
 
 def handle_search_query(query: str, speaker: "Speaker") -> None:
     """Speak top search results for `query`. Never raises."""
     print(f"[search] query='{query}'")
+    speaker.say(f"Searching the internet for {query}.")
     searcher = Searcher()
     try:
         results = searcher.search(query, max_results=5)

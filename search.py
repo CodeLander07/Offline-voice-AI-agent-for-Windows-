@@ -1,22 +1,19 @@
 """
 Project Javis - Web search data layer.
 
-Uses DuckDuckGo's Instant Answer JSON API. No API key, no browser launch,
-no anti-bot blocking. Returns a list of SearchResult(title, snippet, url).
-
-Notes:
-  - The DDG /html/ HTML endpoint now returns a 202 + anomaly-challenge for
-    all non-browser clients; we avoid it entirely.
-  - The Instant Answer API is JSON, free, and bot-friendly, but the answer
-    coverage is best for encyclopedia / factual queries (Wikipedia-sourced
-    Abstract + RelatedTopics). Creative / live-web queries may return
-    fewer results; we surface that honestly with "I didn't find anything."
+Uses a no-key web search feed first, then falls back to DuckDuckGo's
+Instant Answer JSON API. No browser launch. Returns SearchResult rows with
+title, snippet, and URL fields.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
+from html import unescape
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from xml.etree import ElementTree
 
 import requests
 
@@ -24,9 +21,11 @@ import requests
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SEARCH_URL = "https://api.duckduckgo.com/"
+BING_RSS_URL = "https://www.bing.com/search"
+DUCKDUCKGO_ANSWER_URL = "https://api.duckduckgo.com/"
+JINA_DUCKDUCKGO_URL = "https://r.jina.ai/http://duckduckgo.com/html/"
 USER_AGENT = "Javis/1.0 (offline-voice-agent; +https://github.com)"
-DEFAULT_TIMEOUT = 10.0
+DEFAULT_TIMEOUT = 8.0
 MIN_QUERY_LEN = 2
 MAX_QUERY_LEN = 200
 
@@ -41,16 +40,11 @@ class SearcherError(Exception):
 
 
 class NetworkError(SearcherError):
-    """Could not reach the search engine (DNS, offline, timeout)."""
+    """Could not reach the search engine."""
 
 
 class ParseError(SearcherError):
-    """Response was not valid JSON in the expected shape."""
-
-
-# (Removed CAPTCHA / rate-limit errors: the Instant Answer API doesn't
-# serve anti-bot challenges. Kept the simpler hierarchy because the
-# router in javis.py references these names for spoken-fallback messages.)
+    """Response was not in the expected shape."""
 
 
 # ---------------------------------------------------------------------------
@@ -67,20 +61,14 @@ class SearchResult:
 # Searcher
 # ---------------------------------------------------------------------------
 class Searcher:
-    """Performs DuckDuckGo Instant Answer searches and returns structured results."""
+    """Performs web searches and returns structured results."""
 
     def __init__(self, *, user_agent: str = USER_AGENT, timeout: float = DEFAULT_TIMEOUT):
         self.user_agent = user_agent
         self.timeout = timeout
 
     def search(self, query: str, *, max_results: int = 5, timeout: float | None = None) -> list[SearchResult]:
-        """Run a search and return up to `max_results` results.
-
-        Raises:
-            ValueError: query is empty / too short / only stopwords.
-            NetworkError: connection / timeout failure.
-            ParseError: response was not valid JSON in the expected shape.
-        """
+        """Run a search and return up to `max_results` results."""
         query = self._normalize_query(query)
         if not query:
             raise ValueError("Empty search query")
@@ -88,9 +76,51 @@ class Searcher:
             raise ValueError("Query is too short or only stopwords")
 
         timeout = timeout if timeout is not None else self.timeout
+
+        results = self._search_duckduckgo_text(query, max_results=max_results, timeout=timeout)
+        if results:
+            return results
+
+        results = self._search_bing_rss(query, max_results=max_results, timeout=timeout)
+        if results:
+            return results
+
+        return self._search_duckduckgo_answer(query, max_results=max_results, timeout=timeout)
+
+    def _search_duckduckgo_text(self, query: str, *, max_results: int, timeout: float) -> list[SearchResult]:
         try:
             response = requests.get(
-                SEARCH_URL,
+                f"{JINA_DUCKDUCKGO_URL}?q={quote_plus(query)}",
+                headers={"User-Agent": self.user_agent, "Accept": "text/plain"},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            return []
+
+        return _extract_markdown_results(response.text, max_results=max_results)
+
+    def _search_bing_rss(self, query: str, *, max_results: int, timeout: float) -> list[SearchResult]:
+        try:
+            response = requests.get(
+                BING_RSS_URL,
+                params={"q": query, "format": "rss"},
+                headers={"User-Agent": self.user_agent, "Accept": "application/rss+xml, text/xml"},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise NetworkError(f"Connection failed: {exc}") from exc
+
+        try:
+            return _extract_rss_results(response.text, max_results=max_results)
+        except ElementTree.ParseError as exc:
+            raise ParseError(f"Search feed was not valid XML: {exc}") from exc
+
+    def _search_duckduckgo_answer(self, query: str, *, max_results: int, timeout: float) -> list[SearchResult]:
+        try:
+            response = requests.get(
+                DUCKDUCKGO_ANSWER_URL,
                 params={
                     "q": query,
                     "format": "json",
@@ -101,24 +131,21 @@ class Searcher:
                 headers={"User-Agent": self.user_agent, "Accept": "application/json"},
                 timeout=timeout,
             )
+            response.raise_for_status()
         except requests.RequestException as exc:
             raise NetworkError(f"Connection failed: {exc}") from exc
 
-        # The Instant Answer API always returns 200 with a JSON body, even
-        # for queries with no answer. Don't treat the response as a non-200
-        # unless it's truly a hard failure.
         try:
             payload = response.json()
         except (ValueError, json.JSONDecodeError) as exc:
             raise ParseError(f"Non-JSON response from search engine: {exc}") from exc
 
-        return _extract_results(payload, max_results=max_results)
+        return _extract_answer_results(payload, max_results=max_results)
 
     # ---------- internals ----------
 
     @staticmethod
     def _normalize_query(query: str) -> str:
-        """Trim, collapse whitespace, cap to MAX_QUERY_LEN."""
         if not query:
             return ""
         q = " ".join(query.split())
@@ -137,15 +164,64 @@ class Searcher:
 # ---------------------------------------------------------------------------
 # Response parsing
 # ---------------------------------------------------------------------------
-def _extract_results(payload: dict, *, max_results: int) -> list[SearchResult]:
-    """Walk a DuckDuckGo Instant Answer JSON payload into SearchResult rows.
+RESULT_HEADING_RE = re.compile(r"^## \[(?P<title>[^\]]+)\]\((?P<url>[^)]+)\)\s*$", re.MULTILINE)
 
-    Sources, in priority order:
-      1. Abstract + AbstractURL (Wikipedia summary if DDG has one)
-      2. Answer + AnswerType  (e.g., "Sunrise time in Paris: 06:42")
-      3. Definition + DefinitionURL
-      4. RelatedTopics[*].Text + FirstURL  (nested topics are flattened)
-    """
+
+def _extract_markdown_results(markdown_text: str, *, max_results: int) -> list[SearchResult]:
+    matches = list(RESULT_HEADING_RE.finditer(markdown_text))
+    out: list[SearchResult] = []
+
+    for index, match in enumerate(matches):
+        if len(out) >= max_results:
+            break
+
+        block_start = match.end()
+        block_end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown_text)
+        block = markdown_text[block_start:block_end]
+
+        title = _clean_text(match.group("title"))
+        url = _decode_duckduckgo_url(match.group("url"))
+        snippet = _snippet_from_markdown_block(block)
+        if not title and not snippet:
+            continue
+
+        out.append(
+            SearchResult(
+                title=title or "Search result",
+                snippet=snippet or title,
+                url=url,
+            )
+        )
+
+    return out
+
+
+def _extract_rss_results(feed_text: str, *, max_results: int) -> list[SearchResult]:
+    root = ElementTree.fromstring(feed_text)
+    out: list[SearchResult] = []
+
+    for item in root.findall("./channel/item"):
+        if len(out) >= max_results:
+            break
+
+        title = _clean_text(item.findtext("title") or "")
+        snippet = _clean_text(item.findtext("description") or "")
+        url = _clean_text(item.findtext("link") or "")
+        if not title and not snippet:
+            continue
+
+        out.append(
+            SearchResult(
+                title=title or "Search result",
+                snippet=snippet or title,
+                url=url,
+            )
+        )
+
+    return out
+
+
+def _extract_answer_results(payload: dict, *, max_results: int) -> list[SearchResult]:
     out: list[SearchResult] = []
 
     abstract = (payload.get("Abstract") or "").strip()
@@ -180,15 +256,14 @@ def _extract_results(payload: dict, *, max_results: int) -> list[SearchResult]:
             )
         )
 
-    for t in _flatten_related(payload.get("RelatedTopics") or []):
+    for topic in _flatten_related(payload.get("RelatedTopics") or []):
         if len(out) >= max_results:
             break
-        text = (t.get("Text") or "").strip()
-        url = t.get("FirstURL") or ""
+        text = (topic.get("Text") or "").strip()
+        url = topic.get("FirstURL") or ""
         if not text:
             continue
-        # Related topic text format: "<Topic> — <description>"
-        title, _, snippet = text.partition(" — ")
+        title, _, snippet = text.partition(" - ")
         out.append(
             SearchResult(
                 title=title.strip() or "Related topic",
@@ -201,7 +276,6 @@ def _extract_results(payload: dict, *, max_results: int) -> list[SearchResult]:
 
 
 def _flatten_related(related: list, depth: int = 0) -> list[dict]:
-    """Yield leaf topics, recursing into nested Topics lists up to depth 2."""
     if depth > 2:
         return []
     leaves: list[dict] = []
@@ -213,6 +287,47 @@ def _flatten_related(related: list, depth: int = 0) -> list[dict]:
         elif item.get("Text"):
             leaves.append(item)
     return leaves
+
+
+def _clean_text(text: str) -> str:
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = unescape(text)
+    return " ".join(text.split()).strip()
+
+
+def _snippet_from_markdown_block(block: str) -> str:
+    lines = []
+    for raw_line in block.splitlines():
+        line = _clean_text(raw_line)
+        if not line:
+            continue
+        if line.startswith("http://") or line.startswith("https://"):
+            continue
+        line = re.sub(r"^[\w.-]+\.[a-z]{2,}(?:/\S*)?\s*", "", line, flags=re.IGNORECASE)
+        line = re.sub(r"^\d{4}-\d{2}-\d{2}T\S+\s*", "", line)
+        if line.lower().startswith("cached"):
+            continue
+        if not line:
+            continue
+        lines.append(line)
+
+    snippet = " ".join(lines)
+    if len(snippet) > 320:
+        snippet = snippet[:320].rsplit(" ", 1)[0] + "..."
+    return snippet
+
+
+def _decode_duckduckgo_url(url: str) -> str:
+    parsed = urlparse(url)
+    if "duckduckgo.com" not in parsed.netloc:
+        return url
+
+    query = parse_qs(parsed.query)
+    target = query.get("uddg", [""])[0]
+    return unquote(target) if target else url
 
 
 # Public convenience

@@ -48,7 +48,7 @@ REM ---- 4. Create a silent-run helper (used by the startup entry) ----
 echo [4/4] Creating silent launcher...
 > "%~dp0run_silent.bat" echo @echo off
 >> "%~dp0run_silent.bat" echo cd /d "%~dp0"
->> "%~dp0run_silent.bat" echo start "" pythonw.exe "%~dp0javis.py"
+>> "%~dp0run_silent.bat" echo start "" pythonw.exe "%~dp0app_ui.py"
 
 echo.
 echo  ============================================
