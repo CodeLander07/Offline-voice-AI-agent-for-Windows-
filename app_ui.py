@@ -50,6 +50,7 @@ class JavisTerminalApp:
         self._build_layout()
         self._apply_window_icon()
         self._poll_output()
+        self.root.after(60, self._apply_window_icon)
         self.root.after(300, self.start_agent)
 
     def _build_styles(self) -> None:
@@ -189,7 +190,10 @@ class JavisTerminalApp:
 
     def _apply_window_icon(self) -> None:
         if ICON_PATH.exists():
-            self.root.iconbitmap(default=str(ICON_PATH))
+            try:
+                self.root.iconbitmap(default=str(ICON_PATH))
+            except tk.TclError:
+                pass
         if self.logo_image is not None:
             self.root.iconphoto(True, self.logo_image)
 

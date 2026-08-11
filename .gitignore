@@ -1,5 +1,6 @@
 .claude
 __pycache__/
+run_silent.bat
 
 .DS_Store
 Thumbs.db
@@ -29,3 +30,4 @@ coverage/
 .ruff_cache/
 .idea/
 .vscode/
+
