@@ -13,7 +13,7 @@ import javis
 APP_DIR = Path(__file__).resolve().parent
 LOGO_PATH = APP_DIR / "logo.png"
 ICON_PATH = APP_DIR / "logo.ico"
-OFFLINE_MARKER = "__JAVIS_UI_OFFLINE__"
+OFFLINE_MARKER = "__Codelander__"
 WINDOWS_APP_ID = "ProjectJavis.Javis.DeepMidnight.1"
 
 
@@ -31,11 +31,11 @@ class QueueWriter:
         pass
 
 
-class JavisTerminalApp:
+class CodelanderTerminalApp:
     def __init__(self) -> None:
         self._set_windows_app_id()
         self.root = tk.Tk()
-        self.root.title("Javis")
+        self.root.title("Codelander")
         self.root.geometry("960x620")
         self.root.minsize(720, 460)
         self.root.configure(bg="#050713")
@@ -57,7 +57,7 @@ class JavisTerminalApp:
         style = ttk.Style()
         style.theme_use("clam")
         style.configure(
-            "Javis.TButton",
+            "Codelander.TButton",
             background="#111827",
             foreground="#dbeafe",
             bordercolor="#263452",
@@ -66,7 +66,7 @@ class JavisTerminalApp:
             font=("Segoe UI", 10, "bold"),
         )
         style.map(
-            "Javis.TButton",
+            "Codelander.TButton",
             background=[("active", "#1f3b65"), ("disabled", "#101421")],
             foreground=[("disabled", "#64748b")],
         )
@@ -88,7 +88,7 @@ class JavisTerminalApp:
 
         tk.Label(
             title_block,
-            text="JAVIS",
+            text="Codelander",
             bg="#050713",
             fg="#f8fafc",
             font=("Segoe UI", 24, "bold"),
@@ -133,7 +133,7 @@ class JavisTerminalApp:
 
         tk.Label(
             top_bar,
-            text="javis://runtime",
+            text="codelander://runtime",
             bg="#0c1426",
             fg="#7dd3fc",
             font=("Consolas", 10),
@@ -165,8 +165,8 @@ class JavisTerminalApp:
 
         self.start_button = ttk.Button(
             controls,
-            text="Javis Starting",
-            style="Javis.TButton",
+            text="Codelander Starting",
+            style="Codelander.TButton",
             command=self.start_agent,
         )
         self.start_button.pack(side="left")
@@ -174,7 +174,7 @@ class JavisTerminalApp:
         ttk.Button(
             controls,
             text="Close",
-            style="Javis.TButton",
+            style="Codelander.TButton",
             command=self.close,
         ).pack(side="right")
 
@@ -186,7 +186,7 @@ class JavisTerminalApp:
             font=("Segoe UI", 9),
         ).pack(side="left", padx=14)
 
-        self._append("[system] Interface ready. Javis will start automatically.\n")
+        self._append("[system] Interface ready. Codelander will start automatically.\n")
 
     def _apply_window_icon(self) -> None:
         if ICON_PATH.exists():
@@ -228,7 +228,7 @@ class JavisTerminalApp:
         if self.started:
             return
         self.started = True
-        self.start_button.configure(text="Javis Running", state="disabled")
+        self.start_button.configure(text="Codelander Running", state="disabled")
         self.status_label.configure(text="ONLINE", fg="#86efac", bg="#10251d")
 
         self.agent_thread = threading.Thread(target=self._run_agent, daemon=True)
@@ -243,7 +243,7 @@ class JavisTerminalApp:
         try:
             javis.main()
         except Exception as exc:  # noqa: BLE001
-            print(f"[system] Javis stopped with an error: {exc}")
+            print(f"[system] Codelander stopped with an error: {exc}")
         finally:
             sys.stdout = original_stdout
             sys.stderr = original_stderr
@@ -252,7 +252,7 @@ class JavisTerminalApp:
 
     def _mark_offline(self) -> None:
         self.status_label.configure(text="OFFLINE", fg="#94a3b8", bg="#101827")
-        self.start_button.configure(text="Restart Javis", state="normal")
+        self.start_button.configure(text="Restart Codelander", state="normal")
         self.started = False
 
     def close(self) -> None:
@@ -264,4 +264,4 @@ class JavisTerminalApp:
 
 
 if __name__ == "__main__":
-    JavisTerminalApp().run()
+    CodelanderTerminalApp().run()

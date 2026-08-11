@@ -1,5 +1,5 @@
 """
-Project Javis - Voice AI Agent (v2)
+Project Codelander - Voice AI Agent (v2)
 Features:
   1. Greets the user on launch.
   2. Asks "What would you like to do?" and listens for a voice command.
@@ -37,14 +37,31 @@ from search import NetworkError, ParseError, Searcher, SearchResult
 # Configuration
 # ---------------------------------------------------------------------------
 APP_DIR = Path(__file__).resolve().parent
-MODEL_DIR = APP_DIR / "models" / "vosk-model-small-en-us-0.15"
-MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+MODEL_DIR = APP_DIR / "models" / "vosk-model-en-us-0.22-lgraph"
+MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22-lgraph.zip"
 SAMPLE_RATE = 16000
-BLOCK_SIZE = 4000  # ~250ms chunks
+BLOCK_SIZE = 1600  # 100ms chunks - smaller = less latency, more accurate end-of-speech
 GREETING_HOUR_EVENING = 18
 GREETING_HOUR_NIGHT = 22
 
-JARVIS_NAME = "Javis"
+# End-of-speech detection. After the user stops talking, wait this long
+# before finalizing the transcript. 700ms is enough to bridge natural pauses
+# mid-sentence ("search for...weather in Tokyo") without making the user wait
+# noticeably between commands.
+END_OF_SPEECH_SILENCE_SEC = 0.7
+# Minimum amount of speech before we accept silence as "the user is done".
+# Without this, a brief mic tick can fire EndOfSpeech before any words arrive.
+MIN_SPEECH_SEC = 0.25
+# Minimum cumulative loud audio before a transcript is trusted. Vosk sometimes
+# guesses a short filler word from room noise or TTS tail audio.
+MIN_ACCEPTED_VOICE_SEC = 0.35
+# Loudness threshold (RMS over int16 samples) for "speech present".
+# Tuned for typical laptop mics at normal speaking volume. Lower = more
+# sensitive (catches quiet speech but more false positives); higher = only
+# loud speech triggers the detector.
+SILENCE_RMS_THRESHOLD = 600
+
+AGENT_NAME = "Codelander"
 USER_NAME = os.environ.get("", "CODELANDER")
 
 
@@ -72,7 +89,7 @@ class Speaker:
         self.engine.setProperty("volume", 0.95)
 
     def say(self, text: str):
-        print(f"[{JARVIS_NAME}] {text}")
+        print(f"[{AGENT_NAME}] {text}")
         self.engine.say(text)
         self.engine.runAndWait()
 
@@ -87,22 +104,63 @@ class Speaker:
 # STT - Vosk (offline)
 # ---------------------------------------------------------------------------
 class Listener:
-    """Captures mic audio and yields transcribed text via Vosk."""
+    """Captures mic audio and yields transcribed text via Vosk.
+
+    End-of-speech detection is done by measuring RMS amplitude in the
+    incoming audio rather than by relying on Vosk's `AcceptWaveform`
+    boolean. Vosk can commit to a finalized hypothesis mid-sentence on
+    the small model, so the old approach was prone to dropping the tail
+    of an utterance and leaving the recognizer guessing. Waiting for
+    actual silence (and a minimum amount of speech first) keeps the
+    recognizer's hypothesis open until the user is genuinely done.
+    """
 
     def __init__(self, model: Model):
+        self.model = model
         self.recognizer = KaldiRecognizer(model, SAMPLE_RATE)
         self.recognizer.SetWords(True)
         self.audio_q: "queue.Queue[bytes]" = queue.Queue()
 
-    def _callback(self, indata, frames, time_info, status):
+    def _callback(self, indata, _frames, _time_info, status):
+        # sounddevice requires the 4-arg callback signature; we only use indata.
+        del _frames, _time_info
         if status:
             print(f"[audio] {status}", file=sys.stderr)
         self.audio_q.put(bytes(indata))
 
+    @staticmethod
+    def _rms(data: bytes) -> float:
+        """Root-mean-square amplitude of a 16-bit PCM buffer."""
+        if not data:
+            return 0.0
+        # 2 bytes per sample, int16 little-endian
+        n = len(data) // 2
+        if n == 0:
+            return 0.0
+        total = 0
+        for i in range(n):
+            sample = int.from_bytes(data[i * 2 : i * 2 + 2], "little", signed=True)
+            total += sample * sample
+        return (total / n) ** 0.5
+
     def listen_once(self, timeout: float = 8.0) -> str:
-        """Listen until a full sentence is recognized or timeout (seconds)."""
+        """Listen until the user finishes speaking, or `timeout` (seconds)."""
+        self.recognizer = KaldiRecognizer(self.model, SAMPLE_RATE)
+        self.recognizer.SetWords(True)
         deadline = time.time() + timeout
+        # Drain any stale audio from a previous call.
+        while not self.audio_q.empty():
+            try:
+                self.audio_q.get_nowait()
+            except queue.Empty:
+                break
+
         result_text = ""
+        last_partial = ""
+        speech_started_at: float | None = None
+        last_voice_at: float | None = None
+        voiced_seconds = 0.0
+        block_seconds = BLOCK_SIZE / SAMPLE_RATE
 
         with sd.RawInputStream(
             samplerate=SAMPLE_RATE,
@@ -111,35 +169,63 @@ class Listener:
             channels=1,
             callback=self._callback,
         ):
-            print(f"[{JARVIS_NAME}] ...listening...")
+            print(f"[{AGENT_NAME}] ...listening...")
             while time.time() < deadline:
                 try:
-                    data = self.audio_q.get(timeout=0.5)
+                    data = self.audio_q.get(timeout=0.1)
                 except queue.Empty:
-                    if self.recognizer.AcceptWaveform(b""):
-                        # Silence still produces partial updates
-                        pass
+                    # No audio in this window - check end-of-speech condition.
+                    if (
+                        speech_started_at is not None
+                        and last_voice_at is not None
+                        and (time.time() - last_voice_at) >= END_OF_SPEECH_SILENCE_SEC
+                    ):
+                        break
+                    # Keep the recognizer warm even during silence.
+                    self.recognizer.AcceptWaveform(b"")
                     continue
 
-                if self.recognizer.AcceptWaveform(data):
-                    res = json.loads(self.recognizer.Result())
-                    text = res.get("text", "").strip()
-                    if text:
-                        result_text = text
-                        break
-                else:
-                    partial = json.loads(self.recognizer.PartialResult())
-                    p = partial.get("partial", "").strip()
-                    if p:
-                        # Live partial feedback (optional - keep quiet by default)
-                        # print(f"  >> {p}", end="\r")
-                        pass
+                amplitude = self._rms(data)
+                now = time.time()
+                if amplitude >= SILENCE_RMS_THRESHOLD:
+                    if speech_started_at is None:
+                        speech_started_at = now
+                    last_voice_at = now
+                    voiced_seconds += block_seconds
 
-            # Drain any final result
-            if not result_text:
+                # Feed the audio regardless of amplitude so quiet words aren't lost.
+                self.recognizer.AcceptWaveform(data)
+
+                # Live partial feedback (overwrites the same line).
+                try:
+                    partial = json.loads(self.recognizer.PartialResult()).get("partial", "").strip()
+                except (ValueError, json.JSONDecodeError):
+                    partial = ""
+                if partial and partial != last_partial:
+                    print(f"  >> {partial}", end="\r", flush=True)
+                    last_partial = partial
+
+                # If we've heard enough speech followed by enough silence, stop.
+                if (
+                    speech_started_at is not None
+                    and (now - speech_started_at) >= MIN_SPEECH_SEC
+                    and last_voice_at is not None
+                    and (now - last_voice_at) >= END_OF_SPEECH_SILENCE_SEC
+                ):
+                    break
+
+            # Finalize whatever's in the recognizer's hypothesis.
+            try:
                 final = json.loads(self.recognizer.FinalResult())
-                result_text = final.get("text", "").strip()
+            except (ValueError, json.JSONDecodeError):
+                final = {}
+            result_text = (final.get("text") or "").strip()
+            # Clear the partial line.
+            if last_partial:
+                print(" " * max(len(last_partial) + 4, 40), end="\r")
 
+        if voiced_seconds < MIN_ACCEPTED_VOICE_SEC:
+            return ""
         return result_text
 
 
@@ -151,12 +237,12 @@ def ensure_model() -> Model:
     if MODEL_DIR.exists():
         return Model(str(MODEL_DIR))
 
-    print(f"[{JARVIS_NAME}] First run - downloading speech model (~50MB)...")
+    print(f"[{AGENT_NAME}] First run - downloading speech model (~50MB)...")
     MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
     zip_path = MODEL_DIR.parent / "vosk-model.zip"
 
     urlretrieve(MODEL_URL, zip_path)
-    print(f"[{JARVIS_NAME}] Extracting model...")
+    print(f"[{AGENT_NAME}] Extracting model...")
     with zipfile.ZipFile(zip_path, "r") as z:
         z.extractall(MODEL_DIR.parent)
     zip_path.unlink()
@@ -216,13 +302,23 @@ AFFIRMATIVE_PHRASES = (
 FOLLOWUP_TIMEOUT = 5.0
 INITIAL_TIMEOUT = 10.0
 MAX_QUERY_LEN = 80
+IGNORED_UTTERANCES = {
+    "a",
+    "an",
+    "the",
+    "uh",
+    "um",
+    "er",
+    "ah",
+    "hmm",
+}
 
 
 # Regex patterns for search triggers. Order matters: longer phrases first.
 # Capture group 1 is the search query.
 #
 # Each pattern allows:
-#   - Optional wake word prefix: "hey", "javis", "okay", "um", "uh"
+#   - Optional wake word prefix: "hey", "codelander", "okay", "um", "uh"
 #   - Optional filler words: "can you", "please", "i want to", "the"
 #   - Vosk-friendly trigger spellings (search/serge/sarge/such all match)
 #   - Tolerant whitespace
@@ -230,7 +326,7 @@ SEARCH_PATTERNS = (
     # "search for X" / "search about X"
     re.compile(
         r"^(?:hey\s+|okay\s+|um\s+|uh\s+|please\s+)?"
-        r"(?:javis[, ]+\s*)?"
+        r"(?:codelander[, ]+\s*)?"
         r"(?:i\s+want\s+(?:you\s+)?to\s+|can\s+you\s+|could\s+you\s+|please\s+|the\s+)?"
         r"(?:search|serge|sarge|such)\s+(?:for|about|info\s+on|information\s+on)\s+"
         r"(.+)$",
@@ -239,7 +335,7 @@ SEARCH_PATTERNS = (
     # "look up X"
     re.compile(
         r"^(?:hey\s+|okay\s+|um\s+|uh\s+|please\s+)?"
-        r"(?:javis[, ]+\s*)?"
+        r"(?:codelander[, ]+\s*)?"
         r"(?:can\s+you\s+|could\s+you\s+|please\s+|the\s+)?"
         r"look\s+up\s+(.+)$",
         re.IGNORECASE,
@@ -247,7 +343,7 @@ SEARCH_PATTERNS = (
     # "google X"
     re.compile(
         r"^(?:hey\s+|okay\s+|um\s+|uh\s+|please\s+)?"
-        r"(?:javis[, ]+\s*)?"
+        r"(?:codelander[, ]+\s*)?"
         r"(?:can\s+you\s+|could\s+you\s+|please\s+|the\s+)?"
         r"google\s+(.+)$",
         re.IGNORECASE,
@@ -255,7 +351,7 @@ SEARCH_PATTERNS = (
     # "find X" / "find me X" / "find X online"
     re.compile(
         r"^(?:hey\s+|okay\s+|um\s+|uh\s+|please\s+)?"
-        r"(?:javis[, ]+\s*)?"
+        r"(?:codelander[, ]+\s*)?"
         r"(?:can\s+you\s+|could\s+you\s+|please\s+|the\s+)?"
         r"find\s+(?:me\s+|out\s+)?(.+?)(?:\s+online|\s+on\s+the\s+internet|\s+please)?$",
         re.IGNORECASE,
@@ -263,7 +359,7 @@ SEARCH_PATTERNS = (
     # Bare "search X" — last because it's the most permissive
     re.compile(
         r"^(?:hey\s+|okay\s+|um\s+|uh\s+|please\s+)?"
-        r"(?:javis[, ]+\s*)?"
+        r"(?:codelander[, ]+\s*)?"
         r"(?:can\s+you\s+|could\s+you\s+|please\s+|the\s+)?"
         r"(?:search|serge|sarge|such)\s+(.+)$",
         re.IGNORECASE,
@@ -376,22 +472,22 @@ def handle_search_query(query: str, speaker: "Speaker") -> None:
 CLOSE_PROGRAM_PATTERNS = (
     re.compile(
         r"^(?:hey\s+|okay\s+|um\s+|uh\s+|please\s+)?"
-        r"(?:javis[, ]+\s*)?"
+        r"(?:codelander[, ]+\s*)?"
         r"(?:can\s+you\s+|could\s+you\s+|i\s+want\s+you\s+to\s+|the\s+)?"
         r"(?:close|shut\s+down|terminate|end|stop|kill|quit|exit)\s+"
-        r"(?:the\s+)?(?:program|app|application|agent|assistant|javis|jarvis|process|session|yourself)$",
+        r"(?:the\s+)?(?:program|app|application|agent|assistant|codelander|codelander|process|session|yourself)$",
         re.IGNORECASE,
     ),
     re.compile(
         r"^(?:hey\s+|okay\s+|um\s+|uh\s+|please\s+)?"
-        r"(?:javis[, ]+\s*)?"
+        r"(?:codelander[, ]+\s*)?"
         r"(?:can\s+you\s+|could\s+you\s+|i\s+want\s+you\s+to\s+|the\s+)?"
         r"(?:close|shut\s+down|terminate|end|stop|kill|quit|exit)$",
         re.IGNORECASE,
     ),
     re.compile(
         r"^(?:hey\s+|okay\s+|um\s+|uh\s+|please\s+)?"
-        r"(?:javis[, ]+\s*)?"
+        r"(?:codelander[, ]+\s*)?"
         r"(?:can\s+you\s+|could\s+you\s+|please\s+|i\s+want\s+(?:you\s+)?to\s+)?"
         r"(?:power\s+down|go\s+sleep|sign\s+off)$",
         re.IGNORECASE,
@@ -461,8 +557,32 @@ def is_affirmative_phrase(text: str) -> bool:
     return cleaned in AFFIRMATIVE_PHRASES
 
 
+def is_ignored_utterance(text: str) -> bool:
+    """Return True for recognizer noise that should not count as user input."""
+    if not text:
+        return False
+    cleaned = text.strip().lower().rstrip(".?!")
+    return cleaned in IGNORED_UTTERANCES
+
+
+def listen_for_command(listener: Listener, timeout: float) -> str:
+    """Listen until a meaningful utterance arrives or the timeout expires."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        utterance = listener.listen_once(timeout=max(0.1, deadline - time.time()))
+        if not utterance:
+            if time.time() < deadline:
+                continue
+            return ""
+        if is_ignored_utterance(utterance):
+            print(f"[noise] ignored transcript: {utterance!r}")
+            continue
+        return utterance
+    return ""
+
+
 def main():
-    print(f"=== {JARVIS_NAME} starting ===")
+    print(f"=== {AGENT_NAME} starting ===")
     model = ensure_model()
     speaker = Speaker()
     listener = Listener(model)
@@ -471,12 +591,12 @@ def main():
         # 1) Greet the user
         hour = time.localtime().tm_hour
         greeting = greeting_for_hour(hour)
-        speaker.say(f"{greeting}, {USER_NAME}. {JARVIS_NAME} online and at your service.")
+        speaker.say(f"{greeting}, {USER_NAME}. {AGENT_NAME} online and at your service.")
 
         # 2) Main interaction loop
         speaker.say("What would you like to do?")
         first_turn = True
-        utterance = listener.listen_once(timeout=INITIAL_TIMEOUT)
+        utterance = listen_for_command(listener, timeout=INITIAL_TIMEOUT)
 
         while True:
             if not utterance:
@@ -493,7 +613,7 @@ def main():
             # means "go ahead" but isn't itself a search command.
             if not first_turn and is_affirmative_phrase(utterance):
                 speaker.say("Sure. What would you like me to do?")
-                utterance = listener.listen_once(timeout=FOLLOWUP_TIMEOUT)
+                utterance = listen_for_command(listener, timeout=FOLLOWUP_TIMEOUT)
                 first_turn = False
                 continue
 
@@ -508,14 +628,14 @@ def main():
 
             # Follow-up prompt
             speaker.say("Anything else?")
-            utterance = listener.listen_once(timeout=FOLLOWUP_TIMEOUT)
+            utterance = listen_for_command(listener, timeout=FOLLOWUP_TIMEOUT)
             first_turn = False
 
     except KeyboardInterrupt:
-        print(f"\n[{JARVIS_NAME}] Interrupted.")
+        print(f"\n[{AGENT_NAME}] Interrupted.")
     finally:
         speaker.shutdown()
-        print(f"=== {JARVIS_NAME} offline ===")
+        print(f"=== {AGENT_NAME} offline ===")
 
 
 if __name__ == "__main__":

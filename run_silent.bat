@@ -1,3 +1,3 @@
 @echo off
-cd /d "%~dp0"
-start "" pythonw.exe "%~dp0app_ui.py"
+cd /d "C:\Users\PCP\Desktop\Project_Javis\"
+start "" pythonw.exe "C:\Users\PCP\Desktop\Project_Javis\app_ui.py"

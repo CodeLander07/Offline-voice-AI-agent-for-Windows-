@@ -1,5 +1,5 @@
 """
-Project Javis - Web search data layer.
+Project Codelander - Web search data layer.
 
 Uses a no-key web search feed first, then falls back to DuckDuckGo's
 Instant Answer JSON API. No browser launch. Returns SearchResult rows with
@@ -24,7 +24,7 @@ import requests
 BING_RSS_URL = "https://www.bing.com/search"
 DUCKDUCKGO_ANSWER_URL = "https://api.duckduckgo.com/"
 JINA_DUCKDUCKGO_URL = "https://r.jina.ai/http://duckduckgo.com/html/"
-USER_AGENT = "Javis/1.0 (offline-voice-agent; +https://github.com)"
+USER_AGENT = "Codelander/1.0 (offline-voice-agent; +https://github.com)"
 DEFAULT_TIMEOUT = 8.0
 MIN_QUERY_LEN = 2
 MAX_QUERY_LEN = 200
@@ -126,7 +126,7 @@ class Searcher:
                     "format": "json",
                     "no_html": "1",
                     "skip_disambig": "1",
-                    "t": "JavisVoice",
+                    "t": "CodelanderVoice",
                 },
                 headers={"User-Agent": self.user_agent, "Accept": "application/json"},
                 timeout=timeout,
